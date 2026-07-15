@@ -608,7 +608,280 @@ iw reg get
 
 ---
 
-## 十八、恢复与救砖思路
+## 十八、使用 Windows PowerShell 操作
+
+Windows 10/11 通常已经内置 OpenSSH 客户端，可以直接通过 PowerShell 登录路由器、下载备份并校验文件。
+
+### 1. 检查 SSH 和 SCP 是否可用
+
+打开 PowerShell，执行：
+
+```powershell
+ssh -V
+scp
+```
+
+如果 `ssh` 无法识别，可在 Windows 的“可选功能”中安装 **OpenSSH 客户端**。
+
+### 2. SSH 登录路由器
+
+执行：
+
+```powershell
+ssh root@192.168.8.1
+```
+
+首次连接时可能提示：
+
+```text
+Are you sure you want to continue connecting (yes/no/[fingerprint])?
+```
+
+输入：
+
+```text
+yes
+```
+
+然后输入 GL.iNet 后台管理员密码。输入密码时不会显示字符，这是正常现象。
+
+### 3. 在路由器端生成 ART 备份
+
+登录路由器后执行：
+
+```bash
+dd if=/dev/mtd11 of=/tmp/ART-backup.bin
+sha256sum /tmp/ART-backup.bin
+```
+
+记录路由器端的 SHA-256 值。
+
+### 4. 使用 SCP 下载 ART 备份
+
+退出 SSH，或另开一个 PowerShell 窗口。
+
+切换到希望保存备份的目录，例如：
+
+```powershell
+New-Item -ItemType Directory -Force "$HOME\Documents\GL-BE6500-Backup"
+Set-Location "$HOME\Documents\GL-BE6500-Backup"
+```
+
+下载备份：
+
+```powershell
+scp root@192.168.8.1:/tmp/ART-backup.bin .
+```
+
+下载后确认文件存在：
+
+```powershell
+Get-Item .\ART-backup.bin
+```
+
+### 5. 使用 PowerShell 校验 SHA-256
+
+执行：
+
+```powershell
+(Get-FileHash .\ART-backup.bin -Algorithm SHA256).Hash.ToLower()
+```
+
+输出必须与路由器端：
+
+```bash
+sha256sum /tmp/ART-backup.bin
+```
+
+得到的值完全一致。
+
+本次实测原始备份值为：
+
+```text
+f51ab096c7288b87e2f4ba9e29a66eb3357ecc97473f78437bb12274a24820d4
+```
+
+> 不同设备的 ART 内容可能不同，不应把本文的校验值作为其他设备的标准值。应以自己路由器生成的备份为准。
+
+### 6. 同时保存多份备份
+
+建议复制两份并使用明确文件名：
+
+```powershell
+Copy-Item .\ART-backup.bin .\ART-backup-original.bin
+Copy-Item .\ART-backup.bin .\ART-backup-restore.bin
+```
+
+再次校验：
+
+```powershell
+Get-FileHash .\ART-backup*.bin -Algorithm SHA256 |
+    Select-Object Path, Hash
+```
+
+建议再将原始备份复制到 U 盘或其他电脑。
+
+### 7. 从电脑重新上传 ART 备份
+
+需要恢复时，可以把电脑中的原始镜像上传到路由器 `/tmp`：
+
+```powershell
+scp .\ART-backup-original.bin root@192.168.8.1:/tmp/ART-backup-original.bin
+```
+
+登录路由器：
+
+```powershell
+ssh root@192.168.8.1
+```
+
+在路由器中校验上传后的文件：
+
+```bash
+sha256sum /tmp/ART-backup-original.bin
+```
+
+必须与电脑端一致。
+
+### 8. 从上传的备份恢复 ART
+
+在路由器 SSH 终端中执行：
+
+```bash
+mtd verify /tmp/ART-backup-original.bin /dev/mtd11
+```
+
+确认显示：
+
+```text
+Success
+```
+
+然后写回：
+
+```bash
+mtd write /tmp/ART-backup-original.bin /dev/mtd11
+```
+
+写入后再次校验：
+
+```bash
+mtd verify /tmp/ART-backup-original.bin /dev/mtd11
+```
+
+显示 `Success` 后重启：
+
+```bash
+reboot
+```
+
+### 9. PowerShell 一次性下载与校验示例
+
+下面的命令会创建备份目录、下载文件并显示校验值：
+
+```powershell
+$BackupDir = "$HOME\Documents\GL-BE6500-Backup"
+New-Item -ItemType Directory -Force $BackupDir | Out-Null
+Set-Location $BackupDir
+
+scp root@192.168.8.1:/tmp/ART-backup.bin .
+
+if (-not (Test-Path .\ART-backup.bin)) {
+    throw "ART-backup.bin 下载失败。"
+}
+
+$Hash = (Get-FileHash .\ART-backup.bin -Algorithm SHA256).Hash.ToLower()
+Write-Host "ART 备份路径：$((Get-Item .\ART-backup.bin).FullName)"
+Write-Host "SHA-256：$Hash"
+```
+
+### 10. 可选：在 PowerShell 中修改本地副本
+
+更稳妥的做法仍然是在路由器 `/tmp` 中使用经过验证的 `dd` 命令生成修改镜像。如果需要在 Windows PowerShell 中修改副本，可使用 .NET 字节数组：
+
+```powershell
+$Source = ".\ART-backup-original.bin"
+$Target = ".\ART-US.bin"
+
+[byte[]]$Data = [System.IO.File]::ReadAllBytes($Source)
+
+if ($Data.Length -ne 2097152) {
+    throw "镜像大小不是 2 MB，停止操作。"
+}
+
+if ($Data[0x88] -ne 0x43 -or $Data[0x89] -ne 0x4E) {
+    throw "偏移 0x88 处不是 CN，停止操作。"
+}
+
+$Data[0x88] = 0x55
+$Data[0x89] = 0x53
+
+[System.IO.File]::WriteAllBytes($Target, $Data)
+
+Get-Item $Target
+Get-FileHash $Target -Algorithm SHA256
+```
+
+该脚本会：
+
+- 检查镜像是否为 2 MB
+- 检查偏移 `0x88` 是否为 `CN`
+- 将 `CN` 改为 `US`
+- 保存为新的 `ART-US.bin`
+- 不修改原始备份
+
+比较两个文件有多少字节不同：
+
+```powershell
+[byte[]]$Original = [System.IO.File]::ReadAllBytes(".\ART-backup-original.bin")
+[byte[]]$Modified = [System.IO.File]::ReadAllBytes(".\ART-US.bin")
+
+$Diff = for ($i = 0; $i -lt $Original.Length; $i++) {
+    if ($Original[$i] -ne $Modified[$i]) {
+        [PSCustomObject]@{
+            OffsetHex = ('0x{0:X}' -f $i)
+            Original  = ('0x{0:X2}' -f $Original[$i])
+            Modified  = ('0x{0:X2}' -f $Modified[$i])
+        }
+    }
+}
+
+$Diff
+```
+
+正常只能输出：
+
+```text
+OffsetHex Original Modified
+--------- -------- --------
+0x88      0x43     0x55
+0x89      0x4E     0x53
+```
+
+### 11. 将修改镜像上传到路由器
+
+```powershell
+scp .\ART-US.bin root@192.168.8.1:/tmp/ART-US.bin
+```
+
+然后登录路由器，必须先检查文件大小和哈希：
+
+```bash
+ls -l /tmp/ART-US.bin
+sha256sum /tmp/ART-US.bin
+```
+
+再与电脑端 PowerShell 结果比较：
+
+```powershell
+(Get-FileHash .\ART-US.bin -Algorithm SHA256).Hash.ToLower()
+```
+
+两端完全一致后，才能考虑执行 MTD 写入。
+
+---
+
+## 十九、恢复与救砖思路
 
 ### 1. 系统可以启动
 
@@ -654,7 +927,7 @@ reboot
 
 ---
 
-## 十九、免责声明
+## 二十、免责声明
 
 本文仅记录一次真实设备上的技术验证过程。
 
